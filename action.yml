@@ -1,0 +1,79 @@
+name: Sign Android APK (self-use key)
+description: >
+  Decode the self-use keystore from caller secrets, run the caller's gradle packaging command with
+  injected signing properties (no build.gradle change), then verify the APK signature against the
+  pinned certificate digest. Rotating the key happens in this one file plus the repo secrets.
+author: ManonWorkingArea
+
+inputs:
+  gradle-command:
+    description: Gradle invocation WITHOUT signing flags, e.g. "./gradlew --no-daemon :app:assembleDebug"
+    required: true
+  apk-path:
+    description: Path to the produced APK, relative to working-directory
+    required: true
+  working-directory:
+    description: Directory the gradle command runs in
+    required: false
+    default: "."
+  keystore-base64:
+    description: Base64 of the keystore (pass secrets.ANDROID_KEYSTORE_BASE64)
+    required: true
+  keystore-password:
+    description: Keystore password (pass secrets.ANDROID_KEYSTORE_PASSWORD)
+    required: true
+  key-alias:
+    description: Key alias (pass secrets.ANDROID_KEY_ALIAS)
+    required: true
+  key-password:
+    description: Key password (pass secrets.ANDROID_KEY_PASSWORD)
+    required: true
+  expected-sha256:
+    description: apksigner SHA-256 digest of the signing certificate (lowercase hex, no colons)
+    required: false
+    default: "963c658c7569909378dd3bfda9d1e8811039478af9dd1083452c7bbb6c4217ff"
+
+runs:
+  using: composite
+  steps:
+    - name: Decode signing keystore
+      shell: bash
+      env:
+        KS_B64: ${{ inputs.keystore-base64 }}
+      run: |
+        set -euo pipefail
+        if [ -z "$KS_B64" ]; then echo "::error::keystore-base64 is empty"; exit 1; fi
+        umask 077
+        printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/selfuse.jks"
+        test -s "$RUNNER_TEMP/selfuse.jks"
+
+    - name: Gradle build with injected signing
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        KS_FILE: ${{ runner.temp }}/selfuse.jks
+        KS_PASS: ${{ inputs.keystore-password }}
+        KEY_ALIAS: ${{ inputs.key-alias }}
+        KEY_PASS: ${{ inputs.key-password }}
+      run: |
+        set -euo pipefail
+        ${{ inputs.gradle-command }} \
+          -Pandroid.injected.signing.store.file="$KS_FILE" \
+          -Pandroid.injected.signing.store.password="$KS_PASS" \
+          -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+          -Pandroid.injected.signing.key.password="$KEY_PASS"
+
+    - name: Verify APK signature
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        EXPECTED: ${{ inputs.expected-sha256 }}
+      run: |
+        set -euo pipefail
+        apk="${{ inputs.apk-path }}"
+        if [ ! -f "$apk" ]; then echo "::error::APK not found: $apk"; exit 1; fi
+        bt=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+        if [ -z "$bt" ]; then echo "::error::no Android build-tools installed"; exit 1; fi
+        "${bt}apksigner" verify --print-certs "$apk" | tee /tmp/certs.txt
+        grep -q "$EXPECTED" /tmp/certs.txt \
+          || { echo "::error::APK is not signed with the self-use key"; exit 1; }
